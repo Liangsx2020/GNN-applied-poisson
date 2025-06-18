@@ -146,27 +146,23 @@ def jacobi_dl(dvals, omega, A, x):
 
 def loss_batch(model, batch):
     """
-    计算批次中每个图的平均阻尼因子。
-    【已修正】以处理列表形式的 batch.matrix。
+    Calculates the average damping factor for each graph/matrix in the batch using the output from the GNN model
     """
-    # GNN模型处理整个批次的图数据
-    vertex_attr, _, _ = model(batch.x, batch.edge_index, batch.edge_attr, [], batch.batch)
-    
+    vertex_attr, _, _ = model(batch.x, batch.edgeij_pair, batch.edge_attr, [], batch.batch)
     omega = 2./3.
-    total_loss = 0.
-    
-    # 由于matrix和coords已被拼接而非列表，我们需要手动处理每个图
-    # 我们需要从原始数据中获取单个图的matrix和coords
-    # 这里暂时使用一个简化的方法
-    
-    # 注意：这个实现假设我们可以从batch中重建单个图的信息
-    # 但由于matrix被拼接，我们无法直接分离它们
-    # 我们需要一个不同的方法
-    
-    # 临时解决方案：返回一个虚拟损失以便测试训练循环
-    print("Warning: 使用虚拟损失函数，需要修复batch中matrix和coords的处理")
-    dummy_loss = torch.mean(vertex_attr) * 0.001  # 虚拟损失
-    return dummy_loss
+    loss = 0.
+
+    # Whether to use exact damping factor or not
+    exact = not model.training
+    exact = False
+    for i in range(batch.num_graphs):
+        A = batch.matrix[i]
+        xy = batch.coords[i]
+        dvals = vertex_attr[batch.batch == i]
+        df = damping_factor(A, omega, dvals, xy=xy, exact=exact)
+        loss += df
+
+    return loss / batch.num_graphs
 
 def loss_optimal_jacobi(batch):
     """

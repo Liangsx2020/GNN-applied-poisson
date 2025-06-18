@@ -1,240 +1,245 @@
 import torch
-import random
-from torch_geometric.data import Data, Dataset, DataLoader
+from torch_geometric.data import Data, Dataset
+import scipy.sparse as sp
+from scipy.io import loadmat
+import numpy as np
+import os.path as osp
 
-# ===================================================================
-# 步骤 1: 整合所有必要的函数定义
-# ===================================================================
+from joblib import Parallel, delayed
 
-# 离散泊松矩阵代码
-def gen_2d_poisson_matrix(N):
-    """使用二阶精度单侧差分处理Neumann边界"""
-    total_size = N * N
-    row_indices = []
-    col_indices = []
-    values = []
+from getSmallBandMatrices import getSmallBandMatrix
 
-    for j in range(N):
-        for i in range(N):
-            idx = j * N + i
-
-            # Dirichlet边界 (顶部)
-            if j == N - 1:
-                row_indices.append(idx)
-                col_indices.append(idx)
-                values.append(1.0)
-
-            # Neumann边界处理
-            elif j == 0:  # 底边 ∂p/∂y = 0
-                if i == 0:  # 底左角
-                    # x方向: ∂p/∂x = 0 使用 (-3p[0] + 4p[1] - p[2])/(2h) = 0
-                    # y方向: ∂p/∂y = 0 使用 (-3p[0] + 4p[1] - p[2])/(2h) = 0
-                    row_indices.extend([idx, idx, idx, idx])
-                    col_indices.extend([idx, 
-                                      j * N + (i + 1),      # 右邻
-                                      j * N + (i + 2),      # 右邻的邻
-                                      (j + 1) * N + i])     # 上邻
-                    values.extend([6.0, -4.0, 1.0, -3.0])  # x方向2阶 + y方向1阶混合
-
-                elif i == N - 1:  # 底右角
-                    row_indices.extend([idx, idx, idx, idx])
-                    col_indices.extend([idx,
-                                      j * N + (i - 1),      # 左邻
-                                      j * N + (i - 2),      # 左邻的邻
-                                      (j + 1) * N + i])     # 上邻
-                    values.extend([6.0, -4.0, 1.0, -3.0])
-
-                else:  # 底边内部点
-                    # 只处理y方向Neumann: (-3p[i,0] + 4p[i,1] - p[i,2])/(2h) = 0
-                    # x方向保持标准中心差分
-                    row_indices.extend([idx, idx, idx, idx, idx])
-                    col_indices.extend([idx,
-                                      j * N + (i - 1),      # 左邻
-                                      j * N + (i + 1),      # 右邻  
-                                      (j + 1) * N + i,      # 上邻
-                                      (j + 2) * N + i])     # 上邻的邻
-                    values.extend([5.0, -1.0, -1.0, -4.0, 1.0])
-
-            elif i == 0 and j != N - 1:  # 左边 ∂p/∂x = 0
-                # x方向Neumann: (-3p[0,j] + 4p[1,j] - p[2,j])/(2h) = 0
-                # y方向标准中心差分
-                row_indices.extend([idx, idx, idx, idx, idx])
-                col_indices.extend([idx,
-                                  j * N + (i + 1),          # 右邻
-                                  j * N + (i + 2),          # 右邻的邻
-                                  (j - 1) * N + i,          # 下邻
-                                  (j + 1) * N + i])         # 上邻
-                values.extend([5.0, -4.0, 1.0, -1.0, -1.0])
-
-            elif i == N - 1 and j != N - 1:  # 右边 ∂p/∂x = 0  
-                # x方向Neumann: (3p[N-1,j] - 4p[N-2,j] + p[N-3,j])/(2h) = 0
-                row_indices.extend([idx, idx, idx, idx, idx])
-                col_indices.extend([idx,
-                                  j * N + (i - 1),          # 左邻
-                                  j * N + (i - 2),          # 左邻的邻
-                                  (j - 1) * N + i,          # 下邻
-                                  (j + 1) * N + i])         # 上邻
-                values.extend([5.0, -4.0, 1.0, -1.0, -1.0])
-
-            else:  # 内部点：标准5点模板
-                row_indices.extend([idx, idx, idx, idx, idx])
-                col_indices.extend([idx,
-                                  j * N + (i - 1),
-                                  j * N + (i + 1), 
-                                  (j - 1) * N + i,
-                                  (j + 1) * N + i])
-                values.extend([4.0, -1.0, -1.0, -1.0, -1.0])
-
-    # 转换为稀疏矩阵
-    row_indices = torch.tensor(row_indices, dtype=torch.long)
-    col_indices = torch.tensor(col_indices, dtype=torch.long) 
-    values = torch.tensor(values, dtype=torch.float64)
-
-    A = torch.sparse_coo_tensor(
-        torch.stack([row_indices, col_indices]),
-        values,
-        (total_size, total_size)
-    )
-
-    return A
-
-# 不再使用自定义的 MyData 类，直接使用标准 Data 类
-# 我们会在 loss 函数中单独处理 matrix 和 coords
-    
-# 将矩阵转换为图数据
-def convert_matrix_to_graph(A_sparse_coo):
-    """Core conversion function: Converts sparse matrix A to GNN input graph format (Data object)."""
-    A_sparse_coo = A_sparse_coo.coalesce()
-    indices, values = A_sparse_coo.indices(), A_sparse_coo.values()
-    num_nodes = A_sparse_coo.shape[0]
-    vertex_attr_list = [0.] * num_nodes
-    edge_indices, edge_attr_list = [], []
-
-    for i in range(indices.shape[1]):
-        row, col = indices[0, i].item(), indices[1, i].item()
-        val = values[i].item()
-        if row == col:
-            vertex_attr_list[row] = val
-        else:
-            edge_indices.append([row, col])
-            edge_attr_list.append(val)
-
-    vertex_attr = torch.tensor(vertex_attr_list, dtype=torch.float).view(-1, 1)
-    edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
-    edge_attr = torch.tensor(edge_attr_list, dtype=torch.float).view(-1, 1)
-
-    # 使用标准的 Data 类
-    graph_data = Data(x=vertex_attr, 
-                      edge_index=edge_index,
-                      edge_attr=edge_attr)
-    
-    # 将 matrix 和 coords 作为单独的属性存储，但不会参与批量化
-    # 在 loss 函数中我们会单独处理这些
-    graph_data.matrix = A_sparse_coo
-    N = int(A_sparse_coo.shape[0]**0.5)
-    xx, yy = torch.meshgrid(torch.linspace(0, 1, N), torch.linspace(0, 1, N), indexing='xy')
-    graph_data.coords = torch.stack([xx.flatten(), yy.flatten()], dim=1)
-    
-    return graph_data
-
-
-# ===================================================================
-# 步骤 2: 定义 Dataset 类，用于生成训练数据
-# ===================================================================
-
-class MyPoissonDataset(Dataset):
+class HeatEqnFEM2DDataset(Dataset):
     """
-    Create a Dataset class for your Poisson matrix problem.
-    This class inherits from torch_geometric.data.Dataset and automatically handles downloading, processing and loading logic.
+    Dataset for matrices constructed using the heateqnfed2dfun.m function in the
+    paper-software/matlab folder.
+
+    It is assumed the matrices have already been exported out of matlab (use the gettrainingmatrices.m
+    file to generate them). This dataset loads the matrices into pytorch sparse format and saves them
+    to the disk as a single file for loading in the training loop.
     """
-    def __init__(self, root, num_matrices, N_min=16, N_max=64, transform=None, pre_transform=None, pre_filter=None):
+
+    def __init__(self, root, num_matrices, device, transform=None, pre_transform=None, pre_filter=None):
         self.num_matrices = num_matrices
-        self.N_min = N_min
-        self.N_max = N_max
+        super().__init__(root, transform, pre_transform, pre_filter)
+        self.root = root
+        self.device = device
+
+    @property
+    def raw_file_names(self):
+        return [f'heateqn_matrix_{i}.mat' for i in range(self.num_matrices)]
+
+    @property
+    def processed_file_names(self):
+        return [f'heateqn_data_{i}.pt' for i in range(self.num_matrices)]
+
+    def process(self):
+        """Load all matrices, then save them to disk with the filters, etc."""
+        for i in range(self.num_matrices):
+            # Read matrix
+            mat =  loadMatrixFromMatFile(self.root, f'heateqn_matrix_{i}.mat')
+
+            # transform mat into Data object
+            data = pytorchCOOToData(mat)
+
+            # Apply a filter if supplied by user
+            if self.pre_filter is not None and not self.pre_filter(data):
+                continue
+
+            if self.pre_transform is not None:
+                data = self.pre_transform(data)
+
+            torch.save(data, osp.join(self.processed_dir, f'heateqn_data_{i}.pt'))
+    def len(self):
+        return self.num_matrices
+    def get(self, idx):
+        data = torch.load(osp.join(self.processed_dir, f'heateqn_data_{idx}.pt'))
+        return data.to(self.device)
+
+class SmallBandDataset(Dataset):
+    """
+    Dataset for matrices constructed using the getSmallBandMatrices function.
+
+    These matrices have a band of elements that are small and stretched which create poor diagonal elements:
+    -------------------------
+    |   |   |  |||  |   |   |
+    -------------------------
+    |   |   |  |||  |   |   |
+    -------------------------
+    |   |   |  |||  |   |   |
+    -------------------------
+    |   |   |  |||  |   |   |
+    -------------------------
+    |   |   |  |||  |   |   |
+    -------------------------
+
+    The matrices will be generated in the download method and then turned into a Data_w_matrix element in 
+    the process method.
+    """
+
+    def __init__(self, root, num_matrices, device, N_low=15, N_high=80, h_low=0.0001, n_jobs=1, transform=None, pre_transform=None, pre_filter=None):
+        self.num_matrices = num_matrices
+        self.root = root
+        self.device = device
+        self.N_low = N_low
+        self.N_high = N_high
+        self.h_low = h_low
+        self.n_jobs = n_jobs
+        
+        # This needs to run last beacuse the check to process, etc. need the above variables
+        # and run in this init
         super().__init__(root, transform, pre_transform, pre_filter)
 
     @property
     def raw_file_names(self):
-        # Define raw data filenames format
-        return [f'my_matrix_{i}.pt' for i in range(self.num_matrices)]
+        return [f'smallband_matrix_{i}.mat' for i in range(self.num_matrices)]
 
     @property
     def processed_file_names(self):
-        # Define processed data filenames format
-        return [f'my_graph_data_{i}.pt' for i in range(self.num_matrices)]
+        return [f'smallband_data_{i}.pt' for i in range(self.num_matrices)]
 
     def download(self):
-        # This method is called when the "raw" folder does not exist
-        # Our task is to generate and save the original matrices
-        print(f"Raw data not found, starting generation in '{self.raw_dir}'...")
-        for i in range(self.num_matrices):
-            # Randomly select a matrix size N within the specified range
-            N = random.randint(self.N_min, self.N_max)
-            print(f"  Generating matrix {i+1}/{self.num_matrices} (N={N})...")
+        """Build the matrices and save them to a file."""
+        print('Building small band matrices:')
+        if self.n_jobs > 1:
+            Parallel(n_jobs=self.n_jobs)(delayed(self.generate_and_save_matrix)(i) for i in range(self.num_matrices))
+        else:
+            for i in range(self.num_matrices):
+                self.generate_and_save_matrix(i)
             
-            # Generate your Poisson matrix
-            A = gen_2d_poisson_matrix(N)
-            
-            # Save the original matrix
-            torch.save(A, self.raw_paths[i])
-        print("Raw data generation complete.")
+        
+    def generate_and_save_matrix(self, i):
+        # Get a size
+        N = torch.randint(self.N_low, self.N_high, (1,)).item()
+
+        # Get a band width - maximum width depends on the spacing of the grid
+        h_high = 1/(2*(N-2))
+        h = (h_high - self.h_low)*torch.rand(1).item() + self.h_low
+
+        # Get a band location
+        band_loc = 0.9*torch.rand(1).item() + 0.05
+
+        # Get the matrix (ignore the coords for this dataset)
+        K, xy, band_loc = getSmallBandMatrix(N, h, band_loc)
+
+        # Save the matrix to the file
+        d = {'A': K.tocoo(), 'coords': xy, 'band_loc': band_loc, 'h': h}
+        torch.save(d, osp.join(self.raw_dir, f'smallband_matrix_{i}.mat'))
+
+        print('.', end='', flush=True)
+
 
     def process(self):
-        # This method is called when the "processed" folder does not exist
-        # Our task is to read raw matrices, convert to graphs, then save
-        print(f"Processed data not found, starting processing in '{self.processed_dir}'...")
-        for i in range(self.num_matrices):
-            print(f"  Processing matrix {i+1}/{self.num_matrices}...")
-            
-            # Load raw matrix
-            A = torch.load(self.raw_paths[i])
-            
-            # Convert to graph format
-            graph_data = convert_matrix_to_graph(A)
-            
-            # Save processed graph data
-            torch.save(graph_data, self.processed_paths[i])
-        print("Data processing complete.")
+        """Load all matrices, then save them to disk with the filters, etc."""
+        if self.n_jobs > 1:
+            Parallel(n_jobs=self.n_jobs)(delayed(self.process_and_save_data)(i) for i in range(self.num_matrices))
+        else:
+            for i in range(self.num_matrices):
+                self.process_and_save_data(i)
+
+    def process_and_save_data(self, i):
+        # Read matrix
+        mat_dict = torch.load(osp.join(self.raw_dir, f'smallband_matrix_{i}.mat'))
+        mat = ConvertScipyCOOToTorchCOO(mat_dict['A'])
+        xy = mat_dict['coords']
+        band_loc = mat_dict['band_loc']
+        h = mat_dict['h']
+
+        # transform mat into Data object
+        data = pytorchCOOToData(mat, xy, band_loc, h)
+
+        # Apply a filter if supplied by user
+        if self.pre_filter is not None and not self.pre_filter(data):
+            return
+
+        if self.pre_transform is not None:
+            data = self.pre_transform(data)
+
+        torch.save(data, osp.join(self.processed_dir, f'smallband_data_{i}.pt'))
+
+        print('.', end='', flush=True)
+        
 
     def len(self):
-        # Return number of samples in dataset
         return self.num_matrices
 
     def get(self, idx):
-        # Load and return a processed graph data sample
-        data = torch.load(self.processed_paths[idx])
-        return data
+        data = torch.load(osp.join(self.processed_dir, f'smallband_data_{idx}.pt'))
+        return data.to(self.device)
 
 
-# ===================================================================
-# 步骤 3: 主程序入口 - 实际创建数据集
-# ===================================================================
-if __name__ == "__main__":
-    # --Configuration Parameters--
-    dataset_root_dir = './data'
-    num_matrices_to_create = 200
-    min_N = 8
-    max_N = 256
+class Data_w_matrix(Data):
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        if key == 'matrix' or key == 'coords':
+            return None
+        else:
+            return super().__cat_dim__(key, value, *args, **kwargs)
 
-    print(f'About to create dataset in {dataset_root_dir} directory')
-    print(f'Will generate {num_matrices_to_create} samples in total')
-    print(f'Matrix size N will be randomly selected from range [{min_N}, {max_N}]')
+def pytorchCOOToData(coo, xy=None, band_loc=None, h=None):
+    """
+    Convert a pytorch COO to a Data instance for use in the dataset
 
-    # Instantiate Dataset class
-    my_dataset = MyPoissonDataset(
-        root=dataset_root_dir,
-        num_matrices=num_matrices_to_create,
-        N_min=min_N,
-        N_max=max_N
-    )
+    Data instances are also helpful for building batches, etc in pytorch geo for more efficient training
 
-    print("\nDataset created successfully!")
-    print(f"You can check the '{dataset_root_dir}' directory.")
+    The Data instance will also contain the original matrix since we need it for calculating the loss
+    """
+    vals = coo.values()
+    indices = coo.indices()
+    row = []
+    col = []
+    vertex_attr = [0 for _ in range(coo.shape[0])]
+    edge_attr = []
+
+    # Loop through each non-zero
+    for i in range(vals.shape[0]):
+        # i == j - the value belongs to a vertex
+        if indices[0,i] == indices[1,i]:
+            vertex_attr[indices[0,i]] = vals[i].item()
+        else:
+            edge_attr.append(vals[i].item())
+            row.append(indices[0,i].item())
+            col.append(indices[1,i].item())
+
+    edgeij_pair = torch.tensor([row,col])
+    edge_attr = torch.tensor(edge_attr).reshape((-1,1))
+    vertex_attr = torch.tensor(vertex_attr).reshape((-1,1))
+
+    return Data_w_matrix(x=vertex_attr, 
+                         edgeij_pair=edgeij_pair, 
+                         edge_attr=edge_attr, 
+                         matrix = coo, 
+                         coords=xy, 
+                         band_loc=band_loc,
+                         h=h)
+        
     
-    # Let's load a sample to check
-    print("\nLoading first sample for inspection:")
-    first_sample = my_dataset[0]
-    print(first_sample)
-    print(f"Number of nodes in graph: {first_sample.num_nodes}")
-    print(f"Number of edges in graph: {first_sample.num_edges}")
-    print(f"Original matrix attached (matrix): {first_sample.matrix.shape}")
+
+def loadMatrixFromMatFile(root, filename):
+    """
+    Load the MATLAB matrix files and convert them to Pytorch tensors (COO, coalesced)
+
+    Matrices should be in the folder given by root and titled "matrix_{mat number}.mat"
+    """
+    filename = f'{root}/{filename}'
+
+    mat = loadmat(filename)['mat']
+
+    # Mat files load as scipy CSC, convert to COO, then pytorch COO tensor
+    # Note: according to pytorch docs: https://pytorch.org/docs/stable/sparse.html CSR does not
+    #       have CUDA support
+    mat = mat.tocoo()
+
+    return ConvertScipyCOOToTorchCOO(mat)
+
+def ConvertScipyCOOToTorchCOO(mat):
+    row = torch.from_numpy(mat.row.astype(np.int64)).to(torch.long)
+    col = torch.from_numpy(mat.col.astype(np.int64)).to(torch.long)
+    edgeij_pair = torch.stack([row, col], dim=0)
+
+    val = torch.from_numpy(mat.data.astype(np.float64)).to(torch.float)
+
+    mat = torch.sparse_coo_tensor(edgeij_pair, val, torch.Size(mat.shape))
+
+    # Should already be coalesced from MATLAB, but let Pytorch do it to set the flag
+    mat = mat.coalesce()
+    return mat

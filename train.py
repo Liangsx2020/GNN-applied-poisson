@@ -1,90 +1,186 @@
-import os
-import torch
-import random
-from torch_geometric.data import Data, Dataset
+from torch_geometric.nn import MetaLayer
 from torch_geometric.loader import DataLoader
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
 
-from Data import *
+from Data import HeatEqnFEM2DDataset, SmallBandDataset
 from TrainableJacobiGNN import get_model
-from loss import *
-
-# 1. Instantiate GNN model
-model = get_model()
-print("GNN Model Structure:")
-print(model)
-
-# 2. Define optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+from loss import loss_batch, loss_optimal_jacobi, optimal_omega
 
 
+# Set seed for reproducability
+torch.manual_seed(54681)
 
-if __name__ == '__main__':
-    # --- Training Hyperparameters ---
-    NUM_MATRICES_IN_DATASET = 200  # Must match the number used when creating dataset
-    TRAIN_VAL_SPLIT_RATIO = 0.8  # 80% for training, 20% for validation
-    BATCH_SIZE = 10
-    LEARNING_RATE = 1e-3
-    NUM_EPOCHS = 50  # Set to a small number for demonstration, can be increased in practice
+# Should the MetaLayer get moved to the TrainableJacobiGNN.py, instead of importing the pieces and building it here?
+gnn = get_model()
 
-    # --- Load Dataset ---
-    print("Loading created dataset...")
-    # root='./data' points to your data folder
-    dataset = MyPoissonDataset(root='./data', num_matrices=NUM_MATRICES_IN_DATASET).shuffle()
-    
-    # Split into training and validation sets
-    train_size = int(len(dataset) * TRAIN_VAL_SPLIT_RATIO)
-    val_size = len(dataset) - train_size
-    train_dataset = dataset[:train_size]
-    val_dataset = dataset[train_size:]
-    
-    print(f"Dataset loaded successfully: {len(train_dataset)} training samples, {len(val_dataset)} validation samples.")
+# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Create DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)  # Validation set typically doesn't need shuffling
+# Due to the loading pattern of the Dataset, cpu is faster
+device = torch.device('cpu')
+model = gnn.to(device)
 
-    # --- Prepare Model and Optimizer ---
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    model = get_model().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    
-    # --- Training Loop ---
-    print("\nStarting training...")
-    for epoch in range(NUM_EPOCHS):
-        # Training phase
-        model.train()
-        total_train_loss = 0
-        for batch in train_loader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-            
-            # loss_batch function in loss.py needs the entire batch object
-            loss = loss_batch(model, batch)
-            
-            loss.backward()
-            optimizer.step()
-            total_train_loss += loss.item() * batch.num_graphs
-        
-        avg_train_loss = total_train_loss / len(train_dataset)
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+# optimizer = torch.optim.LBFGS(model.parameters())
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
 
-        # Validation phase
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(device)
-                loss = loss_batch(model, batch)
-                total_val_loss += loss.item() * batch.num_graphs
-        
-        avg_val_loss = total_val_loss / len(val_dataset)
+# How frequently do we test the validation set?
+validation_freq = 1
 
-        print(f"Epoch {epoch+1:02d}/{NUM_EPOCHS} | Training Loss: {avg_train_loss:.6f} | Validation Loss: {avg_val_loss:.6f}")
+# Get the dataset
+# dataset = HeatEqnFEM2DDataset('data', 1000, device)
+dataset = SmallBandDataset('data', 100, device, N_low=38, N_high=39, h_low=0.0005, n_jobs=12)
 
-    print("\nTraining complete!")
-    
-    # --- Save Trained Model ---
-    model_save_path = 'my_jacobi_accelerator.pth'
-    torch.save(model.state_dict(), model_save_path)
-    print(f"Model saved to: {model_save_path}")
+
+# Need a training, test, validation split
+dataset = dataset.shuffle()
+train = dataset[:80]
+validation = dataset[80:85]
+test = dataset[85:]
+
+# some training params
+num_epochs = 62
+batch_size = 10
+
+# Create DataLoaders for each set so that each batch can run at once through the GNN
+train_loader = DataLoader(train, batch_size=batch_size)
+validation_loader = DataLoader(validation, batch_size = len(validation))
+test_loader = DataLoader(test, batch_size = len(test))
+
+# validation_loader and test_loader only have one batch, fetch it
+for b in validation_loader:
+    validation_batch = b
+for b in test_loader:
+    test_batch = b
+
+# Train the model
+model.train()  # Sets up some internal variables for denoting training vs eval
+for epoch in range(num_epochs):
+    epoch_loss = 0
+    for batch in train_loader:
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Calc loss - gives avg damping factor for graphs in batch
+        loss = loss_batch(model, batch)
+
+        # Backward pass for gradients
+        loss.backward()
+
+        # Optimizer
+        optimizer.step()
+
+        # Update loss_total
+        epoch_loss += loss.item() * batch.num_graphs
+
+    # Validation and output
+    if (epoch == 0) or ((epoch+1) % validation_freq == 0):
+        model.eval() # Don't need gradient data for validation loss
+        validation_loss = loss_batch(model, validation_batch)
+        print(f'epoch {epoch+1}: training loss: {epoch_loss / len(train)}, validation_loss: {validation_loss}')
+        scheduler.step(validation_loss)
+        model.train() # Back to training mode
+
+# Evaluate performance on test set
+model.eval()
+test_loss = loss_batch(model, test_batch)
+print(f'Test set loss: {test_loss}')
+
+# exit()
+
+optimal_omega_loss = loss_optimal_jacobi(test_batch)
+print(f'Opt Omega test set loss: {optimal_omega_loss}' )
+
+# Compare top model with optimal in the high-frequency space:
+def get_highfreq_modes(N, xy):
+    highModes = []
+    n = int(-1 + np.sqrt(1+N))
+    for thetax in range(1,n+1):
+        for thetay in range(1, n+1):
+            if (thetax > n/2) or (thetay > n/2):
+                t = np.sin(thetax*np.pi*xy[:,0])*np.sin(thetay*np.pi*xy[:,1])            
+                t = t/np.linalg.norm(t)
+                highModes.append(t.reshape(-1,1))
+    highModes = np.hstack(highModes)
+    return highModes
+
+# Get highfreq modes, but we only use the shape of it
+highModes = get_highfreq_modes(test_batch.matrix[0].shape[1], test_batch.coords[0])
+
+# Set up empty arrays to store everything
+evals_A = np.empty((len(test), highModes.shape[1]))
+evals_DinvA = np.empty_like(evals_A)
+evals_TwoThirds_DinvA = np.empty_like(evals_A)  # 2/3 Dinv A
+evals_opt_DinvA = np.empty_like(evals_A)  # optimal Dinv A
+evals_learn_DinvA = np.empty_like(evals_A)  # learned Dinv A
+hs = np.empty(len(test))
+band_locs = np.empty(len(test))
+diag_A = np.empty((len(test), test_batch.matrix[0].shape[0]))
+diag_opt_Dinv = np.empty_like(diag_A)
+diag_learn_Dinv = np.empty_like(diag_A)
+
+# Get the eigenvalues for all of the matrices in the test set
+for idx in range(len(test)):
+    A = test_batch.matrix[idx].detach().to_dense().numpy()
+    xy = test_batch.coords[idx]
+    N = A.shape[1]
+    hs[idx] = test_batch.h[idx]
+    band_locs[idx] = test_batch.band_loc[idx]
+
+    # Get the high-freq modes only
+    highModes = get_highfreq_modes(N, xy)
+
+    # eigenvalues of A on high frequencies
+    evals = np.linalg.eigvals(np.eye(highModes.shape[1]) - highModes.T @ A @ highModes)
+    evals = np.sort(np.abs(evals))
+    evals_A[idx] = evals
+
+    diag_A[idx] = np.diag(A)
+
+    # eigenvalues of Dinv A on high frequencies
+    Dinv = np.diag(1/np.diag(A))
+    evals = np.linalg.eigvals(np.eye(highModes.shape[1]) - highModes.T @ Dinv @ A @ highModes)
+    evals = np.sort(np.abs(evals))
+    evals_DinvA[idx] = evals
+
+    # eigenvalues of (2/3) Dinv A on high frequencies
+    Dinv = (2./3.) * np.diag(1/np.diag(A))
+    evals = np.linalg.eigvals(np.eye(highModes.shape[1]) - highModes.T @ Dinv @ A @ highModes)
+    evals = np.sort(np.abs(evals))
+    evals_TwoThirds_DinvA[idx] = evals
+
+    # eigenvalues of omega Dinv A on high frequencies for optimal omega
+    D_A = np.diag(1/np.diag(A))
+    evals = np.linalg.eigvals(D_A @ A)
+    opt_omega = 2/(np.min(evals) + np.max(evals))
+    Dinv = opt_omega * np.diag(1/np.diag(A))
+    evals = np.linalg.eigvals(np.eye(highModes.shape[1]) - highModes.T @ Dinv @ A @ highModes)
+    evals = np.sort(np.abs(evals))
+    evals_opt_DinvA[idx] = evals
+
+    diag_opt_Dinv[idx] = opt_omega/np.diag(A)
+
+    # eigenvalues of Dinv_learned A on high frequencies
+    vertex_attr, _, _ = model(test_batch.x, test_batch.edgeij_pair, test_batch.edge_attr, [], test_batch.batch) 
+    dvals = vertex_attr[test_batch.batch == idx]
+    learned_diags= (2./3.) * (1/dvals)
+    Dinv_learned = np.diag(learned_diags.detach().numpy().reshape(-1))
+    evals = np.linalg.eigvals(np.eye(highModes.shape[1]) - highModes.T @ Dinv_learned @ A @ highModes)
+    evals = np.sort(np.abs(evals))
+    evals_learn_DinvA[idx] = evals
+
+    diag_learn_Dinv[idx] = learned_diags.detach().numpy().reshape(-1)
+
+np.savez('test_eigenvalues', 
+         evals_A=evals_A, 
+         evals_DinvA=evals_DinvA, 
+         evals_TwoThirds_DinvA=evals_TwoThirds_DinvA,
+         evals_opt_DinvA=evals_opt_DinvA,
+         evals_learn_DinvA=evals_learn_DinvA,
+         diag_A=diag_A,
+         diag_opt_Dinv=diag_opt_Dinv,
+         diag_learn_Dinv=diag_learn_Dinv,
+         hs=hs,
+         band_locs=band_locs)
