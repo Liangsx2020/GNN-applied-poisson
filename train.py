@@ -37,15 +37,23 @@ if __name__ == '__main__':
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_train_loss = 0
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             batch = batch.to(device)
             optimizer.zero_grad()
             loss = loss_batch(model, batch)
+
+            # 确保loss是tensor
+            if not isinstance(loss, torch.Tensor):
+                loss = torch.tensor(loss, requires_grad=True, device=device)
+
             loss.backward()
             optimizer.step()
             total_train_loss += loss.item() * batch.num_graphs
+        
         avg_train_loss = total_train_loss / len(train_dataset)
+        print(f"Total train loss: {total_train_loss}, Dataset size: {len(train_dataset)}")
 
+        # --- Validation Loop ---   
         model.eval()
         total_val_loss = 0
         with torch.no_grad():

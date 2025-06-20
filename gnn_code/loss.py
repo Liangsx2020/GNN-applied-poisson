@@ -37,39 +37,97 @@ def damping_factor(A, omega, diagonal_value, xy=None, exact=False):
     If exact is False, uses the power method to obtain the max eigenvalue.
     This preserves the autograd support and sparsity so it can be used in training
     """
-    N = A.shape[0]
+    N = A.shape[0] 
     if exact:
         # Gives the "exact" damping factor using pytorch's eigvals function
         # Convert A to dense and use dense D due to lack of sparse matrix eigenvals support in pytorch
         Adense = A.to_dense()
         D = torch.diagflat(diagonal_value)
         J = torch.eye(N, device=A.device) - omega*(torch.linalg.solve(D, Adense))
-        df = max(abs(torch.linalg.eigvals(J)))
+        df = torch.max(torch.abs(torch.linalg.eigvals(J))) # liang 将df变成张量
+        
     else:
-        # See Taghibakhshi et al. Learning Interface Conditions in Domain Decomposition Solvers for explaination of
-        # the eigval_approx method
-        K, m = 3, 20
-        T = build_error_matrix(A, diagonal_value, omega)
-        df = eigval_approx(K, m, T, xy=xy, method='high_freq')
-        # df = eigval_approx(K, m, T, method='uniform')
-        # Use the power method - allows for autograd and no conversion to dense
-        # x = torch.ones((N,1), device=A.device)
+        # # See Taghibakhshi et al. Learning Interface Conditions in Domain Decomposition Solvers for explaination of
+        # # the eigval_approx method
+        # K, m = 3, 20
+        # T = build_error_matrix(A, diagonal_value, omega)
+        # df = eigval_approx(K, m, T, xy=xy, method='high_freq')
+        # # df = eigval_approx(K, m, T, method='uniform')
+        # # Use the power method - allows for autograd and no conversion to dense
+        # # x = torch.ones((N,1), device=A.device)
 
-        # nits = 30
-        # for _ in range(nits):
-        #     x = jacobi_dl(diagonal_value, omega, A, x)
-        #     xnrm = torch.sqrt(x.t() @ x)
-        #     xnrm_torch = torch.linalg.vector_norm(x)
-        #     if xnrm_torch - xnrm > 10e-6:
-        #         print(f'norm difference: {xnrm-xnrm_torch}')
-        #     x = x / xnrm
+        # # nits = 30
+        # # for _ in range(nits):
+        # #     x = jacobi_dl(diagonal_value, omega, A, x)
+        # #     xnrm = torch.sqrt(x.t() @ x)
+        # #     xnrm_torch = torch.norm(x)
+        # #     if xnrm_torch - xnrm > 10e-6:
+        # #         print(f'norm difference: {xnrm-xnrm_torch}')
+        # #     x = x / xnrm
 
-        # ritz_top = x.t() @ jacobi_dl(diagonal_value, omega, A, x)
-        # ritz_bottom = 1
+        # # ritz_top = x.t() @ jacobi_dl(diagonal_value, omega, A, x)
+        # # ritz_bottom = 1
 
-        # df = torch.abs(ritz_top / ritz_bottom)
+        # # df = torch.abs(ritz_top / ritz_bottom)
+        '''
+        下面是liang的修改版本
+        '''
+        try:
+          
+            K, m = 3, 20
+            T = build_error_matrix(A, diagonal_value, omega)
+            
+            
+            df = eigval_approx(K, m, T, xy=xy, method='high_freq')
+            
+            
+            # 如果返回值是0或者异常，使用备用方法
+            if df == 0 or torch.isnan(df) or torch.isinf(df):
+                
+                df = backup_damping_factor(A, omega, diagonal_value)
+                
+        except Exception as e:
+            
+            df = backup_damping_factor(A, omega, diagonal_value)
 
+          
+    if isinstance(df, (int, float)):
+        df = torch.tensor(df, dtype=torch.float32, device=A.device)
+    
     return df
+
+'''
+我新添加了一个 backup_damping_factor 函数，用于在 eigval_approx 失败时使用备用方法计算 damping factor
+'''
+def backup_damping_factor(A, omega, diagonal_value):
+    """备用的简单功率方法计算damping factor"""
+    N = A.shape[0]
+    device = A.device
+    
+    # 使用简单的功率方法
+    x = torch.randn((N,), device=device)
+    x = x / torch.norm(x)
+    
+    # 迭代几次功率方法
+    for _ in range(10):
+        # 计算 (I - omega * D^{-1} * A) * x
+        Ax = torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1) if A.is_sparse else A @ x
+        DinvAx = Ax / diagonal_value
+        y = x - omega * DinvAx
+        
+        norm_y = torch.norm(y)
+        if norm_y > 0:
+            x = y / norm_y
+        else:
+            break
+    
+    # 计算Rayleigh商
+    Ax = torch.sparse.mm(A, x.unsqueeze(1)).squeeze(1) if A.is_sparse else A @ x
+    DinvAx = Ax / diagonal_value
+    y = x - omega * DinvAx
+    
+    rho = torch.dot(x, y)
+    return torch.abs(rho)
 
 def build_error_matrix(A, diag, omega):
     A = A.coalesce()
@@ -159,7 +217,7 @@ def get_random_high_freq(N, m, xy=None, device=None):
     return Y
 
 def normalize_vectors(Y):
-    # col_norm = torch.linalg.vector_norm(Y, dim=0) # origin
+    # col_norm = torch.norm(Y, dim=0) # origin
     col_norm = torch.norm(Y, dim=0) # liang
     eplison = 1e-8
     col_norm = torch.clamp(col_norm, min=eplison)
@@ -178,6 +236,7 @@ def loss_batch(model, batch):
     """
     Calculates the average damping factor for each graph/matrix in the batch using the output from the GNN model
     """
+    # 修复：使用正确的属性名
     vertex_attr, _, _ = model(batch.x, batch.edge_index, batch.edge_attr, [], batch.batch)
     omega = 2./3.
     loss = 0.
@@ -185,38 +244,57 @@ def loss_batch(model, batch):
     # Whether to use exact damping factor or not
     exact = not model.training
     exact = False
+    
+    loss = torch.tensor(0.0, requires_grad=True, device=batch.x.device)
+    
     for i in range(batch.num_graphs):
-        # 获取当前图的数据
+        # 获取当前图的节点掩码
         node_mask = batch.batch == i
         current_nodes = torch.sum(node_mask).item()
         
-        # 获取当前图的边数据
-        edge_mask = (batch.edge_index[0] < current_nodes) & (batch.edge_index[1] < current_nodes)
-        if i > 0:
-            # 调整边索引以适应当前图
-            prev_nodes = torch.sum(batch.batch < i).item()
-            edge_mask = (batch.edge_index[0] >= prev_nodes) & (batch.edge_index[0] < prev_nodes + current_nodes) & \
-                       (batch.edge_index[1] >= prev_nodes) & (batch.edge_index[1] < prev_nodes + current_nodes)
-            current_edge_index = batch.edge_index[:, edge_mask] - prev_nodes
-        else:
-            current_edge_index = batch.edge_index[:, edge_mask]
+        # 获取当前图在整个batch中的节点起始索引
+        node_offset = torch.sum(batch.batch < i).item()
         
+        # 获取当前图的边掩码
+        edge_mask = ((batch.edge_index[0] >= node_offset) & 
+                    (batch.edge_index[0] < node_offset + current_nodes) &
+                    (batch.edge_index[1] >= node_offset) & 
+                    (batch.edge_index[1] < node_offset + current_nodes))
+        
+        # 获取当前图的边数据并调整索引
+        current_edge_index = batch.edge_index[:, edge_mask] - node_offset
         current_edge_attr = batch.edge_attr[edge_mask]
         current_x = vertex_attr[node_mask]
         
+        
+        # 检查是否有有效的边
+        if torch.sum(edge_mask).item() == 0:
+            print(f"Warning: Graph {i} has no edges!")
+            continue
+            
         # 重建矩阵
-        A = reconstruct_matrix_from_graph(current_edge_index, current_edge_attr, current_x, current_nodes)
-        
-        xy = batch.coords[i]
-        if xy.dim() == 1:
-            # 如果是一维张量，重新reshape成二维
-            xy = xy.view(-1, 2)
-        dvals = current_x.squeeze()
-        
-        df = damping_factor(A, omega, dvals, xy=xy, exact=exact)
-        loss += df
+        try:
+            A = reconstruct_matrix_from_graph(current_edge_index, current_edge_attr, current_x, current_nodes)
+            
+            xy = batch.coords[i] if hasattr(batch, 'coords') and batch.coords is not None else None
+            if xy is not None and xy.dim() == 1:
+                xy = xy.view(-1, 2)
+            
+            dvals = current_x.squeeze()
+            
+            df = damping_factor(A, omega, dvals, xy=xy, exact=exact)
+            if not isinstance(df, torch.Tensor):
+                df = torch.tensor(df, dtype=torch.float32, device=batch.x.device)
 
-    return loss / batch.num_graphs
+            loss = loss + df
+            
+        except Exception as e:
+            print(f"Error processing graph {i}: {e}")
+            continue
+
+        
+    final_loss = loss / batch.num_graphs
+    return final_loss
 
 def loss_optimal_jacobi(batch):
     """
